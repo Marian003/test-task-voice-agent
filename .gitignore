@@ -1,0 +1,16 @@
+# Secrets — never commit. `.env.example` is the committed template.
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# LiveKit plugin model downloads
+livekit/

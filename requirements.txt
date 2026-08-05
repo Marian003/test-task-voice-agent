@@ -1,0 +1,4 @@
+# Exact pins. The agent overrides framework internals (`stt_node`, `on_user_turn_completed`),
+# so a minor bump can change behaviour silently — upgrade deliberately, with the tests green.
+livekit-agents[deepgram,elevenlabs,openai,silero]==1.6.8
+python-dotenv==1.2.2
