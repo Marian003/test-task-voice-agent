@@ -252,10 +252,17 @@ ruff check . && ruff format --check .
 coverage run -m pytest && coverage report      # gate: 98% on agent.py + confidence.py
 ```
 
-There's a [CI workflow](.github/workflows/ci.yml) that runs all of that on 3.10 and 3.12, plus
-`python demo.py` so the output quoted above can't quietly drift from the code. Everything in it
-passes locally; the workflow itself hasn't run on a real runner yet, since this hasn't been
-pushed anywhere with Actions enabled. No network and no keys at any point.
+[CI](.github/workflows/ci.yml) runs all of that on 3.10 and 3.12 on every push, plus
+`python demo.py` so the output quoted above can't quietly drift from the code. No network and
+no keys at any point.
+
+Worth saying that the first CI run went red on two things the local suite was perfectly happy
+with, both of them bugs in my own test harness rather than in the agent. The fake audio sink
+reported playback finished on flushes where it had been handed no frames, which trips LiveKit's
+false-interruption resume and fires a second generation, making "the last context the LLM saw"
+non-deterministic. And the session fixture held `fake_job_context()` open across a yield;
+pytest-asyncio finalises async-generator fixtures in a different `Context` from the one that
+set them up, so resetting the ContextVar blew up and errored every teardown. Both are fixed.
 
 Three layers:
 
@@ -307,10 +314,10 @@ without a voice session, while `agent.py` holds what can only be exercised again
 
 Worth being precise about, because "it works" means nothing without saying how you know.
 
-Verified in CI, on every push: the confidence policy end to end; `stt_node` capture and
-pass-through; injection, ordering, history isolation and `StopResponse` under a real
-`AgentSession`; the provider wiring and the config gate; 100% line coverage of `agent.py` and
-`confidence.py`; ruff clean.
+Green in CI on 3.10 and 3.12, on every push: the confidence policy end to end; `stt_node`
+capture and pass-through; injection, ordering, history isolation and `StopResponse` under a
+real `AgentSession`; the provider wiring and the config gate; 100% line coverage of `agent.py`
+and `confidence.py`; ruff clean.
 
 Not verified: audio over the network. The plugin constructors and their arguments are asserted,
 but no bytes have gone to Deepgram, OpenAI or ElevenLabs from this checkout. The integration
@@ -323,9 +330,9 @@ reviewer with keys should run.
 Listing these rather than pretending they aren't there:
 
 - The integration tests wait on a fixed `asyncio.sleep(0.6)` per turn instead of on session
-  events. Stable locally and 3/3 on repeat runs, but it's a wall-clock assumption, it's the
-  first thing I'd expect to flake on a busy runner, and it's why the suite takes ~17s rather
-  than ~3s. There's a TODO on it.
+  events. Green on CI, but it's a wall-clock assumption, it's the first thing I'd expect to
+  flake on a busy runner, and it's why the suite takes ~17s rather than ~3s. There's a TODO
+  on it.
 - `TurnBuffer.consume()` can't distinguish a leftover final that happens to be
   token-identical to the start of the next turn. Needs per-turn ids from the framework to do
   properly; the cost is one final's word weight, so I left it.
