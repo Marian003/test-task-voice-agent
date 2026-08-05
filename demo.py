@@ -1,12 +1,13 @@
-"""Offline demo: replay STT events through the real agent and print what the LLM sees.
+"""Offline demo: push STT events through the real agent and print what the LLM gets.
 
-This drives the actual `stt_node` and `on_user_turn_completed` code paths from `agent.py`
-with synthetic Deepgram events, so it needs no API keys, no microphone and no LiveKit
-server. Everything printed below is produced by the shipped code, not written by hand.
+Runs the actual stt_node and on_user_turn_completed from agent.py against synthetic
+Deepgram events. No keys, no microphone, no LiveKit server. Everything it prints is
+produced by the shipped code.
 
     python demo.py
 
-For the real audio loop (Deepgram -> OpenAI -> ElevenLabs), see the README.
+For the real audio loop see the README. For the same paths driven by a real AgentSession,
+see tests/test_integration.py.
 """
 
 from __future__ import annotations
@@ -25,8 +26,8 @@ from confidence import Settings, build_instructions
 Final = tuple[str, float]
 
 
-class _DemoSession:
-    """Stands in for `AgentSession`, recording what would have been spoken."""
+class _Session:
+    """Stands in for AgentSession, just to capture what would have been said."""
 
     def __init__(self, spoken: list[str]) -> None:
         self._spoken = spoken
@@ -35,19 +36,18 @@ class _DemoSession:
         self._spoken.append(text)
 
 
-class _DemoAgent(ConfidenceAwareAgent):
+class _Agent(ConfidenceAwareAgent):
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
         self.spoken: list[str] = []
 
     @property
-    def session(self) -> _DemoSession:  # type: ignore[override]
-        return _DemoSession(self.spoken)
+    def session(self) -> _Session:  # type: ignore[override]
+        return _Session(self.spoken)
 
 
 @contextlib.contextmanager
 def _canned_stt(events: Sequence[stt.SpeechEvent]) -> Iterator[None]:
-    """Replace the framework's STT stream with canned events for the duration of a turn."""
     original = Agent.default.stt_node
 
     async def replay(*_args: object, **_kwargs: object) -> AsyncIterator[stt.SpeechEvent]:
@@ -70,11 +70,11 @@ def _final(text: str, confidence: float) -> stt.SpeechEvent:
 
 async def _no_audio() -> AsyncIterator[rtc.AudioFrame]:
     return
-    yield  # pragma: no cover - makes this an async generator
+    yield  # pragma: no cover - only here to make this an async generator
 
 
 async def scenario(title: str, finals: Sequence[Final], **env: str) -> None:
-    agent = _DemoAgent(Settings.from_env(env))
+    agent = _Agent(Settings.from_env(env))
     transcript = " ".join(text for text, _ in finals)
 
     print(f"\n=== {title} ===")

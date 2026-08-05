@@ -17,7 +17,7 @@ from confidence import (
     aggregate,
     build_annotation,
     build_instructions,
-    normalize,
+    tokenize,
 )
 
 
@@ -73,7 +73,7 @@ def test_single_sample_scores_itself() -> None:
     result = aggregate([Sample("hello there", 0.91)])
     assert result is not None
     assert result.score == pytest.approx(0.91)
-    assert (result.minimum, result.maximum, result.samples, result.words) == (0.91, 0.91, 1, 2)
+    assert (result.minimum, result.samples, result.words) == (0.91, 1, 2)
 
 
 def test_short_filler_does_not_drag_a_clean_turn_low() -> None:
@@ -121,7 +121,8 @@ def test_buffer_clamps_out_of_range_confidence() -> None:
     buffer.add("b", -0.2)
     result = buffer.consume("a b")
     assert result is not None
-    assert (result.minimum, result.maximum) == (0.0, 1.0)
+    assert result.minimum == 0.0
+    assert result.score == pytest.approx(0.5)  # 1.4 -> 1.0 and -0.2 -> 0.0
 
 
 def test_consume_matches_finals_against_the_assembled_transcript() -> None:
@@ -220,9 +221,19 @@ def test_empty_transcript_keeps_every_sample() -> None:
     assert result.samples == 1
 
 
-def test_normalize_strips_case_and_punctuation() -> None:
-    assert normalize("  Hello,   World! ") == "hello world"
-    assert normalize("...") == ""
+def test_a_gap_in_the_middle_is_not_coverage() -> None:
+    """Regression: matching "somewhere after the cursor" let ["yes", "no"] skip a token
+    in "yes yes no" and still pass a start/end check, scoring 0.53 instead of deferring.
+    """
+    buffer = TurnBuffer()
+    buffer.add("yes", 0.95)
+    buffer.add("no", 0.10)
+    assert buffer.consume("yes yes no") is None
+
+
+def test_tokenize_strips_case_and_punctuation() -> None:
+    assert tokenize("  Hello,   World! ") == ["hello", "world"]
+    assert tokenize("...") == []
 
 
 # --- settings -----------------------------------------------------------------------

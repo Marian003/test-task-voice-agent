@@ -1,20 +1,18 @@
-"""Voice agent that reads Deepgram's STT confidence and changes behaviour on it.
+"""Voice agent that reads Deepgram's STT confidence and changes what it does with it.
 
-    User speech -> Deepgram STT -> LLM (+ confidence) -> ElevenLabs TTS -> User
-                        |                  ^
-                        +---- confidence --+
+    speech -> Deepgram STT -> LLM (+ confidence) -> ElevenLabs TTS -> speech
+                   |                ^
+                   +-- confidence --+
 
-Two hooks carry the metadata across the pipeline:
+Two hooks carry the number across the pipeline:
 
-  1. `stt_node`                — the only place the raw `SpeechEvent` (and therefore
-                                 `alternatives[i].confidence`) is visible. We observe the
-                                 final transcripts as they stream past and change nothing.
-  2. `on_user_turn_completed`  — fires after the user's turn ends and before inference.
-                                 We aggregate what we saw, then either inject the score
-                                 into the context for this turn only, or short-circuit
-                                 the turn with a fixed clarification.
+  stt_node                 the only place the raw SpeechEvent is visible, so the only
+                           place alternatives[i].confidence can be read. We watch the
+                           finals go past and change nothing about them.
+  on_user_turn_completed   fires once the user's turn ends, before inference. We score
+                           what we saw and either annotate the context or stop the turn.
 
-All decisions live in `confidence.py`; this module is wiring and logging.
+The policy lives in confidence.py. This file is wiring and logging.
 """
 
 from __future__ import annotations
@@ -52,14 +50,11 @@ from confidence import (
 
 load_dotenv()
 
-# No `basicConfig` here: `cli.run_app` installs LiveKit's own handler, and configuring
-# the root logger ourselves would duplicate every record.
+# No basicConfig: cli.run_app installs LiveKit's handler and we'd only duplicate records.
 logger = logging.getLogger("confidence-agent")
 
 
 class ConfidenceAwareAgent(Agent):
-    """An agent that answers, hedges, or asks for a repeat based on STT confidence."""
-
     def __init__(self, settings: Settings) -> None:
         super().__init__(instructions=build_instructions(settings))
         self._settings = settings
@@ -67,42 +62,36 @@ class ConfidenceAwareAgent(Agent):
         self._scores: list[float] = []
         self._low_turns = 0
 
-    # -- 1) Observe confidence at the source ---------------------------------------
     async def stt_node(
         self,
         audio: AsyncIterable[rtc.AudioFrame],
         model_settings: ModelSettings,
     ) -> AsyncGenerator[stt.SpeechEvent | str, None]:
-        """Pass STT events through untouched, recording the confidence of each final."""
+        """Tap, not filter: note the confidence of each final and pass everything through."""
         async for event in Agent.default.stt_node(self, audio, model_settings):
-            # The node may also yield plain strings (transcript-only STT paths).
+            # the node is typed to yield plain strings too, on transcript-only paths
             if (
                 isinstance(event, stt.SpeechEvent)
                 and event.type is stt.SpeechEventType.FINAL_TRANSCRIPT
                 and event.alternatives
             ):
-                alternative = event.alternatives[0]
-                if self._buffer.add(alternative.text, alternative.confidence):
+                alt = event.alternatives[0]
+                if self._buffer.add(alt.text, alt.confidence):
                     logger.debug(
                         "stt final transcript",
-                        extra={
-                            "transcript": alternative.text,
-                            "confidence": round(alternative.confidence, 4),
-                        },
+                        extra={"transcript": alt.text, "confidence": round(alt.confidence, 4)},
                     )
             yield event
 
-    # -- 2) Act on it, just before inference ----------------------------------------
     async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage) -> None:
-        """Resolve this turn's confidence and either annotate the context or stop the turn."""
         transcript = new_message.text_content or ""
         detail = self._buffer.consume(transcript)
         score, source = self._resolve(detail, new_message)
 
         if score is None:
-            # A text-only turn, or STT reported nothing. Say nothing rather than guess:
-            # the instructions treat an un-annotated message as an ordinary one.
-            logger.debug("no confidence available for this turn", extra={"transcript": transcript})
+            # Text-only turn, or STT gave us nothing usable. Leave it alone; the
+            # instructions already say an un-annotated message is an ordinary one.
+            logger.debug("no confidence for this turn", extra={"transcript": transcript})
             return
 
         band = self._settings.thresholds.band(score)
@@ -121,18 +110,18 @@ class ConfidenceAwareAgent(Agent):
         )
 
         if band is Band.LOW and self._settings.strategy is Strategy.DETERMINISTIC:
-            # Guaranteed behaviour: speak the clarification and skip inference entirely,
-            # so a garbled turn can never be answered even if the model ignores a prompt.
-            # `StopResponse` also keeps the unreliable transcript out of the history.
+            # Structural, not prompted: the LLM is never called, so it cannot answer a
+            # garbled request however it might have been inclined to. StopResponse also
+            # keeps the untrusted transcript out of the conversation history.
             self.session.say(self._settings.clarification)
             raise StopResponse
 
-        # `turn_ctx` is a per-turn copy, so this note reaches the LLM for this generation
-        # only and never accumulates in the persisted conversation history.
+        # turn_ctx is a per-turn copy, so this reaches the model for this generation only
+        # and never piles up in the history.
         turn_ctx.add_message(role="system", content=build_annotation(band, score, source, detail))
 
     async def on_exit(self) -> None:
-        """Log a session-level confidence summary — a cheap check for a bad mic or model."""
+        """Session summary. Cheap way to spot a bad mic or a model mismatch after the fact."""
         if not self._scores:
             return
         logger.info(
@@ -145,17 +134,16 @@ class ConfidenceAwareAgent(Agent):
             },
         )
 
-    # -- helpers ---------------------------------------------------------------------
     def _resolve(
         self, detail: Aggregate | None, new_message: ChatMessage
     ) -> tuple[float, Source] | tuple[None, None]:
-        """Pick this turn's confidence, most trustworthy source first."""
+        """This turn's confidence, most trustworthy source first."""
         if self._settings.forced_confidence is not None:
             return self._settings.forced_confidence, Source.FORCED
         if detail is not None:
             return detail.score, Source.STT
-        # Safety net: LiveKit computes its own mean of the turn's finals. Used when our
-        # buffer was empty or its contents did not describe this turn.
+        # Safety net. LiveKit keeps its own mean of the turn's finals; use it when our
+        # buffer was empty or didn't describe this turn.
         native = new_message.transcript_confidence
         if native is not None:
             return native, Source.SESSION
@@ -163,7 +151,7 @@ class ConfidenceAwareAgent(Agent):
 
 
 def build_session(settings: Settings, vad: silero.VAD) -> AgentSession:
-    """Assemble the voice pipeline. Separated from `entrypoint` so it can be asserted on."""
+    """Assemble the pipeline. Split out from entrypoint so it can be asserted on."""
     if settings.forced_confidence is not None:
         logger.warning(
             "FORCE_CONFIDENCE=%.2f is set: every turn will use this SIMULATED value and "
@@ -171,8 +159,8 @@ def build_session(settings: Settings, vad: silero.VAD) -> AgentSession:
             settings.forced_confidence,
         )
     return AgentSession(
-        # `smart_format` is left off deliberately: it rewrites numbers and dates, which
-        # would stop a final transcript from matching its slice of the assembled turn.
+        # smart_format stays off. It rewrites numbers and dates, which would stop a final
+        # from lining up with its slice of the assembled turn.
         stt=deepgram.STT(model="nova-3", language="en-US"),
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=elevenlabs.TTS(),
@@ -181,7 +169,6 @@ def build_session(settings: Settings, vad: silero.VAD) -> AgentSession:
 
 
 def prewarm(process: JobProcess) -> None:
-    """Load slow resources once per worker process rather than once per call."""
     process.userdata["vad"] = silero.VAD.load()
 
 
@@ -197,11 +184,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 def main() -> None:
-    # Validate before handing control to the worker. A `ConfigError` raised inside
-    # `prewarm` would only be logged and retried by LiveKit's process pool
-    # (`ipc/proc_pool.py`: "error initializing process" ... "retrying"), and one raised
-    # inside `on_user_turn_completed` is swallowed outright, silently dropping the reply.
-    # Failing here exits the parent process with a readable message and nothing spawned.
+    # Validate before handing over to the worker. A ConfigError from prewarm only gets
+    # logged and retried by the process pool (ipc/proc_pool.py: "error initializing
+    # process" -> "retrying"), and one from on_user_turn_completed is swallowed outright,
+    # which silently drops the reply. Failing here exits with a readable message and
+    # nothing spawned.
     try:
         Settings.from_env()
     except ConfigError as exc:
