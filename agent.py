@@ -41,6 +41,7 @@ from livekit.plugins import deepgram, elevenlabs, openai, silero
 from confidence import (
     Aggregate,
     Band,
+    ConfigError,
     Settings,
     Source,
     Strategy,
@@ -147,54 +148,67 @@ class ConfidenceAwareAgent(Agent):
     # -- helpers ---------------------------------------------------------------------
     def _resolve(
         self, detail: Aggregate | None, new_message: ChatMessage
-    ) -> tuple[float | None, Source]:
+    ) -> tuple[float, Source] | tuple[None, None]:
         """Pick this turn's confidence, most trustworthy source first."""
         if self._settings.forced_confidence is not None:
             return self._settings.forced_confidence, Source.FORCED
         if detail is not None:
             return detail.score, Source.STT
         # Safety net: LiveKit computes its own mean of the turn's finals. Used when our
-        # buffer was empty or its contents did not match the assembled transcript.
+        # buffer was empty or its contents did not describe this turn.
         native = new_message.transcript_confidence
         if native is not None:
             return native, Source.SESSION
-        return None, Source.SESSION
+        return None, None
 
 
-def prewarm(process: JobProcess) -> None:
-    """Load slow resources once per worker process, not once per call."""
-    # Validate configuration at worker start-up so a typo in `.env` fails loudly here
-    # rather than raising mid-turn, where the framework would swallow it and the agent
-    # would simply go silent.
-    Settings.from_env()
-    process.userdata["vad"] = silero.VAD.load()
-
-
-async def entrypoint(ctx: JobContext) -> None:
-    settings = Settings.from_env()
+def build_session(settings: Settings, vad: silero.VAD) -> AgentSession:
+    """Assemble the voice pipeline. Separated from `entrypoint` so it can be asserted on."""
     if settings.forced_confidence is not None:
         logger.warning(
             "FORCE_CONFIDENCE=%.2f is set: every turn will use this SIMULATED value and "
             "Deepgram's real confidence will be ignored. Unset it for real measurements.",
             settings.forced_confidence,
         )
-
-    await ctx.connect()
-
-    session = AgentSession(
+    return AgentSession(
         # `smart_format` is left off deliberately: it rewrites numbers and dates, which
         # would stop a final transcript from matching its slice of the assembled turn.
         stt=deepgram.STT(model="nova-3", language="en-US"),
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=elevenlabs.TTS(),
-        vad=ctx.proc.userdata.get("vad") or silero.VAD.load(),
+        vad=vad,
     )
 
+
+def prewarm(process: JobProcess) -> None:
+    """Load slow resources once per worker process rather than once per call."""
+    process.userdata["vad"] = silero.VAD.load()
+
+
+async def entrypoint(ctx: JobContext) -> None:
+    settings = Settings.from_env()
+    await ctx.connect()
+
+    session = build_session(settings, ctx.proc.userdata.get("vad") or silero.VAD.load())
     await session.start(agent=ConfidenceAwareAgent(settings), room=ctx.room)
     await session.generate_reply(
         instructions="Greet the user in one short sentence and offer to help."
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
+    # Validate before handing control to the worker. A `ConfigError` raised inside
+    # `prewarm` would only be logged and retried by LiveKit's process pool
+    # (`ipc/proc_pool.py`: "error initializing process" ... "retrying"), and one raised
+    # inside `on_user_turn_completed` is swallowed outright, silently dropping the reply.
+    # Failing here exits the parent process with a readable message and nothing spawned.
+    try:
+        Settings.from_env()
+    except ConfigError as exc:
+        raise SystemExit(f"configuration error: {exc}") from exc
+
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+
+
+if __name__ == "__main__":
+    main()

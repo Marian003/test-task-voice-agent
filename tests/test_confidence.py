@@ -133,6 +133,60 @@ def test_consume_matches_finals_against_the_assembled_transcript() -> None:
     assert result.samples == 2
 
 
+def test_matching_is_on_token_runs_not_substrings() -> None:
+    """Regression: `"no"` must not match inside `"i know that"` and drag the turn down."""
+    buffer = TurnBuffer()
+    buffer.add("no", 0.10)  # stale leftover from a discarded turn
+    buffer.add("i know that", 0.95)
+    result = buffer.consume("i know that")
+    assert result is not None
+    assert result.samples == 1
+    assert result.score == pytest.approx(0.95)
+
+
+def test_a_fragment_inside_a_longer_word_is_not_a_match() -> None:
+    buffer = TurnBuffer()
+    buffer.add("art", 0.10)
+    buffer.add("that was smart", 0.95)
+    result = buffer.consume("that was smart")
+    assert result is not None
+    assert result.samples == 1
+    assert result.score == pytest.approx(0.95)
+
+
+def test_repeated_words_are_matched_positionally_not_reused() -> None:
+    buffer = TurnBuffer()
+    buffer.add("yes", 0.9)
+    buffer.add("yes", 0.5)
+    result = buffer.consume("yes yes")
+    assert result is not None
+    assert result.samples == 2
+    assert result.score == pytest.approx(0.7)
+
+
+def test_punctuation_only_finals_are_skipped_without_breaking_coverage() -> None:
+    buffer = TurnBuffer()
+    buffer.add("...", 0.10)
+    buffer.add("hello", 0.90)
+    result = buffer.consume("hello")
+    assert result is not None
+    assert result.samples == 1
+    assert result.score == pytest.approx(0.90)
+
+
+def test_partial_coverage_defers_to_the_caller() -> None:
+    """Half a turn is not evidence for the whole turn — fall back rather than guess."""
+    buffer = TurnBuffer()
+    buffer.add("i need help", 0.4)
+    assert buffer.consume("i need help with my order") is None
+
+
+def test_coverage_must_start_at_the_first_token() -> None:
+    buffer = TurnBuffer()
+    buffer.add("with my order", 0.4)
+    assert buffer.consume("i need help with my order") is None
+
+
 def test_consume_always_empties_the_buffer() -> None:
     buffer = TurnBuffer()
     buffer.add("hello", 0.9)
@@ -237,8 +291,9 @@ def test_instructions_quote_the_configured_thresholds() -> None:
     text = build_instructions(
         Settings.from_env({"HIGH_CONFIDENCE": "0.9", "LOW_CONFIDENCE": "0.7"})
     )
-    assert ">= 0.90" in text
-    assert "<  0.70" in text
+    assert "high   (0.90 to 1.00)" in text
+    assert "medium (0.70 up to 0.90)" in text
+    assert "low    (0.00 up to 0.70)" in text
 
 
 def test_instructions_forbid_leaking_the_metadata() -> None:

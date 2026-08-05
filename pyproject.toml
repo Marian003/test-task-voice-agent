@@ -7,6 +7,14 @@ asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-q --strict-markers"
 
+[tool.coverage.run]
+source = ["agent", "confidence"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 98
+exclude_lines = ['pragma: no cover', 'if __name__ == "__main__":']
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

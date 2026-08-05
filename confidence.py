@@ -34,6 +34,7 @@ __all__ = [
     "build_annotation",
     "build_instructions",
     "normalize",
+    "tokenize",
 ]
 
 
@@ -83,7 +84,7 @@ DEFAULT_CLARIFICATION = "Sorry, I may have misunderstood you. Could you please r
 
 # Words only: drops punctuation and casing so a Deepgram final ("my order.") still
 # matches its slice of the assembled turn transcript ("I need help with my order").
-_WORD_RE = re.compile(r"[a-z0-9]+")
+_WORD_RE = re.compile(r"[a-z0-9']+")
 
 
 def normalize(text: str) -> str:
@@ -91,8 +92,24 @@ def normalize(text: str) -> str:
     return " ".join(_WORD_RE.findall(text.lower()))
 
 
+def tokenize(text: str) -> list[str]:
+    """Lowercase word tokens. Matching is done on these, never on raw substrings."""
+    return _WORD_RE.findall(text.lower())
+
+
+def _find_tokens(haystack: Sequence[str], needle: Sequence[str], start: int) -> int | None:
+    """Index of `needle` as a contiguous run in `haystack` at or after `start`."""
+    if not needle:
+        return None
+    last = len(haystack) - len(needle)
+    for i in range(start, last + 1):
+        if haystack[i : i + len(needle)] == list(needle):
+            return i
+    return None
+
+
 def _word_count(text: str) -> int:
-    return len(_WORD_RE.findall(text.lower()))
+    return len(tokenize(text))
 
 
 def _clamp01(value: float) -> float:
@@ -148,12 +165,6 @@ class Aggregate:
     samples: int
     words: int
 
-    def __str__(self) -> str:
-        return (
-            f"score={self.score:.2f} min={self.minimum:.2f} "
-            f"max={self.maximum:.2f} finals={self.samples} words={self.words}"
-        )
-
 
 def aggregate(samples: Sequence[Sample]) -> Aggregate | None:
     """Combine a turn's finals into a single score, or `None` if there are none.
@@ -206,29 +217,50 @@ class TurnBuffer:
         self._samples.append(Sample(text=text, confidence=_clamp01(confidence)))
         return True
 
-    def clear(self) -> None:
-        self._samples.clear()
-
     def consume(self, transcript: str) -> Aggregate | None:
-        """Drain the buffer and aggregate the samples that belong to `transcript`.
+        """Drain the buffer and aggregate the samples that reconstruct `transcript`.
 
-        The buffer is *always* emptied, even when the result is discarded. Samples that
-        do not appear in the assembled turn transcript are dropped: they are left over
+        The buffer is *always* emptied, even when the result is discarded.
+
+        LiveKit builds a turn's transcript by appending each final in order
+        (`audio_recognition.py`: `self._audio_transcript += f" {transcript}"`), so this
+        replays that assembly: walk the samples in order, matching each one's tokens as a
+        contiguous run at or after a moving cursor. Samples that do not land are left over
         from a turn that was interrupted or discarded before the completion hook ran, and
-        letting them survive would mark an unrelated later turn as low-confidence.
+        are dropped — letting them survive would mark an unrelated later turn low.
 
-        Returns `None` when nothing usable remains, which tells the caller to fall back
-        to LiveKit's own measurement rather than guess.
+        The match must be *exact*: the surviving samples have to start at the first token
+        and consume the last. Anything less means the buffer does not describe this turn,
+        and the method returns `None` so the caller falls back to LiveKit's own
+        measurement rather than scoring a turn from partial evidence.
+
+        Matching is on token runs, never on raw substrings — `"no"` must not match inside
+        `"i know that"`.
         """
         samples, self._samples = self._samples, []
         if not samples:
             return None
 
-        target = normalize(transcript)
+        target = tokenize(transcript)
         if not target:
+            # No transcript to check against (e.g. a transcript-free turn); trust the buffer.
             return aggregate(samples)
 
-        kept = [s for s in samples if (n := normalize(s.text)) and n in target]
+        kept: list[Sample] = []
+        cursor = 0
+        first_index: int | None = None
+        for sample in samples:
+            tokens = tokenize(sample.text)
+            index = _find_tokens(target, tokens, cursor)
+            if index is None:
+                continue
+            if first_index is None:
+                first_index = index
+            kept.append(sample)
+            cursor = index + len(tokens)
+
+        if first_index != 0 or cursor != len(target):
+            return None  # partial or unrecognised coverage -> defer to the caller
         return aggregate(kept)
 
 
@@ -296,13 +328,13 @@ def build_instructions(settings: Settings) -> str:
         "recogniser's confidence in the transcript that follows, as a score in [0.0, 1.0] "
         "and one of three bands. When that note is present, it applies to the very next "
         "user message and you must follow the matching rule:",
-        f"  - high   (>= {settings.thresholds.high:.2f}): you heard the user clearly. "
+        f"  - high   ({settings.thresholds.high:.2f} to 1.00): you heard the user clearly. "
         "Answer normally.",
-        f"  - medium (>= {settings.thresholds.low:.2f}): probably correct. Answer, but you may "
-        "briefly confirm the part you are least sure of.",
-        f"  - low    (<  {settings.thresholds.low:.2f}): you likely misheard. Do NOT attempt to "
-        "answer or guess at the request. Apologise briefly and ask the user to repeat or "
-        "rephrase.",
+        f"  - medium ({settings.thresholds.low:.2f} up to {settings.thresholds.high:.2f}): "
+        "probably correct. Answer, but you may briefly confirm the part you are least sure of.",
+        f"  - low    (0.00 up to {settings.thresholds.low:.2f}): you likely misheard. Do NOT "
+        "attempt to answer or guess at the request. Apologise briefly and ask the user to "
+        "repeat or rephrase.",
         "",
         "When no note is present, treat the message normally.",
         "Never say the confidence number, the band name, or the word 'transcript' out loud. "

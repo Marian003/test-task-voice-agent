@@ -38,7 +38,7 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 
 python demo.py                     # replays STT events through the real agent
-pytest                             # 59 tests
+pytest                             # the full suite, ~3s
 ```
 
 For the real audio loop, see [Running the real voice loop](#running-the-real-voice-loop).
@@ -113,12 +113,32 @@ score in the system note, the text in the user message immediately after it. Quo
 second time inside the note would waste tokens on every turn and invite the model to answer the
 quoted copy rather than the user.
 
-**Why stale samples are discarded.**
+**Why stale samples are discarded, and how.**
 LiveKit skips `on_user_turn_completed` when speech scheduling is paused, so a buffer keyed only
 on that hook can survive into the next turn and mark an unrelated utterance as low-confidence.
-`TurnBuffer.consume()` is always draining, and keeps only the finals that actually appear in the
-assembled turn transcript. If nothing matches, it returns `None` and the agent falls back to
-LiveKit's own measurement rather than guessing.
+`TurnBuffer.consume()` is therefore always draining, and it verifies that what it holds actually
+describes the turn.
+
+The check replays how LiveKit assembles a transcript — it appends each final in order
+(`audio_recognition.py`: `self._audio_transcript += f" {transcript}"`) — by walking the samples
+and matching each one's **token run** at or after a moving cursor. The surviving samples must
+start at the first token and consume the last; partial coverage means the buffer does not
+describe this turn, and `consume()` returns `None` so the agent falls back to LiveKit's own
+measurement rather than scoring from partial evidence.
+
+Matching is on token runs, never raw substrings. Naive containment lets `"no"` match inside
+`"i know that"` and `"art"` inside `"smart"`, which would drag a clean 0.95 turn to 0.74 and
+across a band boundary. Both cases are pinned by regression tests.
+
+*Known limit:* if a discarded turn's final is token-identical to the start of the next turn
+(`"yes"` then `"yes, what time do you close"`), it is indistinguishable from a legitimate final
+without per-turn IDs from the framework, and is kept. It contributes its own word weight only.
+
+**Why `StopResponse` on the low band, and its cost.**
+Skipping the LLM keeps the unreliable transcript out of the conversation history — but the
+spoken clarification is still recorded, so history can contain an assistant message with no
+preceding user turn. That is the deliberate trade: a slightly odd transcript beats persisting
+text the recogniser itself does not trust.
 
 **Why the policy lives in its own module.**
 [`confidence.py`](confidence.py) has no LiveKit, network or I/O imports, so every rule the
@@ -212,10 +232,19 @@ All keys and tuning live in `.env`; copy [`.env.example`](.env.example) and fill
 | `CLARIFICATION_PROMPT` | | *(see below)* | What the agent says on a low-confidence turn |
 | `FORCE_CONFIDENCE` | | *(unset)* | Simulate a fixed score for reproducible demos |
 
-Malformed values are rejected **at worker start-up** with a readable message, not mid-turn.
-This matters: LiveKit catches exceptions raised inside `on_user_turn_completed` and returns,
-so a typo like `FORCE_CONFIDENCE=high` validated lazily would make the agent silently drop
-every reply with no user-visible symptom.
+Malformed values are rejected in `main()` **before `cli.run_app` is called**, exiting the
+parent process with a readable message and nothing spawned:
+
+```
+$ FORCE_CONFIDENCE=high python agent.py console
+configuration error: FORCE_CONFIDENCE must be a number in [0.0, 1.0], got 'high'
+```
+
+The placement is deliberate. Validating inside `on_user_turn_completed` is worst — LiveKit
+catches the exception and returns, silently dropping every reply with no visible symptom.
+Validating inside `prewarm` is only marginally better: the process pool catches it too
+(`ipc/proc_pool.py`, *"error initializing process"* → *"retrying"*), producing a loop of
+failing worker spawns instead of a clean exit.
 
 ### Forcing a confidence value for a reproducible demo
 
@@ -273,19 +302,27 @@ LiveKit client SDK pointed at `ws://localhost:7880`.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 59 tests, ~2s, no network and no keys
 ruff check . && ruff format --check .
+coverage run -m pytest && coverage report   # gate: 98% on agent.py + confidence.py
 ```
+
+All three run on every push via [CI](.github/workflows/ci.yml), on Python 3.10 and 3.12, plus
+`python demo.py` to prove the documented output is still what the code produces. No network and
+no keys at any point.
 
 [`tests/test_confidence.py`](tests/test_confidence.py) covers band boundaries, threshold
 validation, weighted aggregation (including the filler-word and long-garbled-clause cases),
-buffer draining and stale-sample rejection, and every environment-variable failure mode.
+buffer draining, token-run matching (with the `"no"`/`"i know"` and `"art"`/`"smart"`
+regressions), coverage rejection, and every environment-variable failure mode.
 
-[`tests/test_agent.py`](tests/test_agent.py) drives the real hooks against real `ChatContext`
-and `ChatMessage` objects with a stub session: that `stt_node` forwards every event untouched,
-that the note lands immediately before the user message, that it never leaks into persisted
-history, that a low-confidence turn raises `StopResponse` without reaching the LLM, and that
-each confidence source wins in the right order.
+[`tests/test_agent.py`](tests/test_agent.py) drives the real hooks against real `ChatContext`,
+`ChatMessage` and `SpeechEvent` objects with a stub session. Confidence always enters through
+the real `stt_node` rather than by seeding the buffer, so capture → aggregate → act is
+exercised in one piece: that `stt_node` forwards every event untouched, that the note lands
+immediately before the user message, that it never leaks into persisted history, that a
+low-confidence turn raises `StopResponse` without reaching the LLM, that each confidence source
+wins in the right order, and that `build_session` wires the required providers and `main`
+refuses to spawn a worker on bad configuration.
 
 ---
 
@@ -293,17 +330,19 @@ each confidence source wins in the right order.
 
 ```
 .
-├── agent.py               # Pipeline wiring + the two override hooks
-├── confidence.py          # All policy: bands, aggregation, settings, prompts (no I/O)
-├── demo.py                # Offline replay — real code paths, no keys required
+├── agent.py                    # Pipeline wiring + the two override hooks
+├── confidence.py               # All policy: bands, aggregation, settings, prompts (no I/O)
+├── demo.py                     # Offline replay — real code paths, no keys required
 ├── tests/
 │   ├── test_confidence.py
 │   └── test_agent.py
-├── requirements.txt       # Exact pins
-├── requirements-dev.txt   # + pytest, ruff
-├── pyproject.toml         # pytest & ruff configuration
-├── .env.example           # Committed template
-├── .env                   # Your keys (git-ignored)
+├── .github/workflows/ci.yml    # ruff + pytest + coverage gate + demo, on 3.10 and 3.12
+├── requirements.txt            # Exact pins
+├── requirements-dev.txt        # + pytest, coverage, ruff
+├── pyproject.toml              # pytest, coverage & ruff configuration
+├── .env.example                # Committed template
+├── .env                        # Your keys (git-ignored)
+├── .gitattributes
 └── .gitignore
 ```
 
@@ -320,14 +359,18 @@ Stated plainly, because "it works" is worth nothing without saying how it was ch
 
 | Component | Status |
 |-----------|--------|
-| Confidence policy — bands, aggregation, buffering, config validation | ✅ 59 passing unit tests |
+| Confidence policy — bands, aggregation, token matching, config validation | ✅ Unit-tested |
 | `stt_node` capture and pass-through | ✅ Tested against real `SpeechEvent` objects with a stubbed stream |
 | `on_user_turn_completed` injection, ordering, history isolation, `StopResponse` | ✅ Tested against real `ChatContext` / `ChatMessage` |
+| Pipeline wiring, `prewarm`, `entrypoint`, config gate in `main` | ✅ Tested with real plugin constructors and a stub room |
+| Line coverage of `agent.py` + `confidence.py` | ✅ 100% (gate set at 98%) |
 | Lint & format | ✅ `ruff check` and `ruff format --check` clean |
 | Deepgram → OpenAI → ElevenLabs over live audio | ⚠️ **Not run.** Requires the three API keys and a local `livekit-server`, neither of which is included here |
 
-The confidence mechanism is verified; the network hop to the three providers is standard
-LiveKit plugin wiring and is the part a reviewer should exercise with their own keys.
+Everything except the last row is verified in CI. That row is the honest gap: the plugin
+constructors and their arguments are asserted, but no audio has crossed the network, so
+`session.say()` under a live `AgentSession` — the deterministic clarification path — has been
+exercised only against a stub. It is the first thing a reviewer with keys should check.
 
 ---
 
@@ -339,7 +382,7 @@ LiveKit plugin wiring and is the part a reviewer should exercise with their own 
 | Working real-time voice pipeline | `AgentSession` wires Deepgram → OpenAI → ElevenLabs with Silero VAD |
 | Proper Deepgram integration | `deepgram.STT(model="nova-3", language="en-US")`; `smart_format` deliberately left off so finals stay matchable against the assembled transcript |
 | Correct extraction & propagation of confidence | `stt_node` reads `alternatives[0].confidence`; `on_user_turn_completed` aggregates and injects it, with LiveKit's `transcript_confidence` as a fallback |
-| Clean architecture & code quality | Policy/IO split, no mid-turn failure modes, typed throughout, ruff-clean, 59 tests |
+| Clean architecture & code quality | Policy/IO split, no mid-turn failure modes, typed throughout, ruff-clean, 100% line coverage, CI |
 | Clear documentation | This README, plus a runnable `demo.py` instead of hand-written example output |
 | Agent behaviour changes based on confidence | Three bands; the low band is enforced structurally via `StopResponse`, not by hoping the model obeys a prompt |
 
