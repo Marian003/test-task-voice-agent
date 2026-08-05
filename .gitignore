@@ -8,9 +8,11 @@
 __pycache__/
 *.py[cod]
 
-# Tooling caches
+# Tooling caches and reports
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
 # LiveKit plugin model downloads
 livekit/
