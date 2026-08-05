@@ -12,10 +12,10 @@ reaches the LLM, and that the metadata note is present in the context the LLM re
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+import contextlib
+from collections.abc import AsyncIterator
 
 import pytest
-import pytest_asyncio
 from livekit.agents import AgentSession
 from livekit.agents.testing import fake_job_context
 
@@ -58,7 +58,16 @@ class Harness:
         return self.llm.system_notes()
 
 
-async def _run(**env: str) -> AsyncIterator[Harness]:
+@contextlib.asynccontextmanager
+async def running_agent(**env: str) -> AsyncIterator[Harness]:
+    """Start a real AgentSession on fake providers.
+
+    Deliberately a context manager used inside the test rather than a fixture.
+    fake_job_context() sets a ContextVar, and pytest-asyncio finalises an async-generator
+    fixture in a different Context from the one that set it up, so resetting the token
+    there blows up with "was created in a different Context". Entering and leaving inside
+    the test body keeps both halves in the same context.
+    """
     stt, llm, tts = ScriptedSTT(), ScriptedLLM(), ScriptedTTS()
     session = AgentSession(
         stt=stt,
@@ -77,126 +86,130 @@ async def _run(**env: str) -> AsyncIterator[Harness]:
             await session.aclose()
 
 
-@pytest_asyncio.fixture
-async def agent_session() -> AsyncIterator[Harness]:
-    async for harness in _run():
-        yield harness
-
-
-@pytest_asyncio.fixture
-async def llm_strategy_session() -> AsyncIterator[Harness]:
-    async for harness in _run(LOW_CONFIDENCE_STRATEGY="llm"):
-        yield harness
+def roles_of(ctx: object) -> list[str | None]:
+    return [getattr(item, "role", None) for item in ctx.items]  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_a_clear_turn_reaches_the_llm_with_its_confidence(agent_session: Harness) -> None:
-    await agent_session.say([("what time do you close today", 0.94)])
+async def test_a_clear_turn_reaches_the_llm_with_its_confidence() -> None:
+    async with running_agent() as agent:
+        await agent.say([("what time do you close today", 0.94)])
 
-    assert agent_session.llm.seen_contexts, "the LLM should have been called"
-    note = agent_session.notes[-1]
-    assert "band=high" in note
-    assert "score=0.94" in note
-    assert "Sure, happy to help." in agent_session.spoken
+        assert agent.llm.seen_contexts, "the LLM should have been called"
+        note = agent.notes[-1]
+        assert "band=high" in note
+        assert "score=0.94" in note
+        assert "Sure, happy to help." in agent.spoken
 
 
 @pytest.mark.asyncio
-async def test_a_garbled_turn_never_reaches_the_llm(agent_session: Harness) -> None:
+async def test_a_garbled_turn_never_reaches_the_llm() -> None:
     """The behaviour the whole task is about, driven by the real session."""
-    await agent_session.say([("i need help with my order", 0.35)])
+    async with running_agent() as agent:
+        await agent.say([("i need help with my order", 0.35)])
 
-    assert agent_session.llm.seen_contexts == [], "the LLM must not be called on a low turn"
-    assert agent_session.spoken == CLARIFICATION
-
-
-@pytest.mark.asyncio
-async def test_the_garbled_transcript_stays_out_of_history(agent_session: Harness) -> None:
-    await agent_session.say([("i need help with my order", 0.35)])
-
-    history = " ".join(
-        getattr(item, "text_content", "") or "" for item in agent_session.session.history.items
-    )
-    assert "i need help with my order" not in history
+        assert agent.llm.seen_contexts == [], "the LLM must not be called on a low turn"
+        assert agent.spoken == CLARIFICATION
 
 
 @pytest.mark.asyncio
-async def test_the_same_words_get_opposite_treatment(agent_session: Harness) -> None:
+async def test_the_garbled_transcript_stays_out_of_history() -> None:
+    async with running_agent() as agent:
+        await agent.say([("i need help with my order", 0.35)])
+
+        history = " ".join(
+            getattr(item, "text_content", "") or "" for item in agent.session.history.items
+        )
+        assert "i need help with my order" not in history
+
+
+@pytest.mark.asyncio
+async def test_the_same_words_get_opposite_treatment() -> None:
     """Identical text, different confidence, different behaviour end to end."""
-    await agent_session.say([("i need help with my order", 0.35)])
-    low_calls = len(agent_session.llm.seen_contexts)
+    async with running_agent() as agent:
+        await agent.say([("i need help with my order", 0.35)])
+        low_calls = len(agent.llm.seen_contexts)
 
-    await agent_session.say([("i need help with my order", 0.92)])
+        await agent.say([("i need help with my order", 0.92)])
 
-    assert low_calls == 0
-    assert len(agent_session.llm.seen_contexts) == 1
-    assert "band=high" in agent_session.notes[-1]
-
-
-@pytest.mark.asyncio
-async def test_a_filler_word_does_not_cost_the_user_a_repeat(agent_session: Harness) -> None:
-    await agent_session.say([("um", 0.31), ("what time do you close today", 0.96)])
-
-    assert "band=high" in agent_session.notes[-1]
-    assert "Sorry" not in agent_session.spoken
+        assert low_calls == 0
+        assert len(agent.llm.seen_contexts) == 1
+        assert "band=high" in agent.notes[-1]
 
 
 @pytest.mark.asyncio
-async def test_confidence_is_scoped_to_its_own_turn(agent_session: Harness) -> None:
+async def test_a_filler_word_does_not_cost_the_user_a_repeat() -> None:
+    async with running_agent() as agent:
+        await agent.say([("um", 0.31), ("what time do you close today", 0.96)])
+
+        assert "band=high" in agent.notes[-1]
+        assert "Sorry" not in agent.spoken
+
+
+@pytest.mark.asyncio
+async def test_confidence_is_scoped_to_its_own_turn() -> None:
     """A low turn must not leave anything behind that taints the next one."""
-    await agent_session.say([("mumble mumble", 0.30)])
-    await agent_session.say([("what time do you close today", 0.95)])
+    async with running_agent() as agent:
+        await agent.say([("mumble mumble", 0.30)])
+        await agent.say([("what time do you close today", 0.95)])
 
-    assert "band=high" in agent_session.notes[-1]
-    assert len(agent_session.notes) == 1, "only the second turn should have reached the LLM"
-
-
-@pytest.mark.asyncio
-async def test_the_note_does_not_accumulate_across_turns(agent_session: Harness) -> None:
-    await agent_session.say([("first question here", 0.95)])
-    await agent_session.say([("second question here", 0.95)])
-
-    latest = agent_session.llm.seen_contexts[-1]
-    notes = [
-        item
-        for item in latest.items
-        if getattr(item, "role", None) == "system"
-        and (item.text_content or "").startswith("[stt-confidence]")
-    ]
-    assert len(notes) == 1, "each generation should carry exactly one note, for the current turn"
+        assert "band=high" in agent.notes[-1]
+        assert len(agent.notes) == 1, "only the second turn should have reached the LLM"
 
 
 @pytest.mark.asyncio
-async def test_llm_strategy_lets_the_model_answer_a_low_turn(
-    llm_strategy_session: Harness,
-) -> None:
-    await llm_strategy_session.say([("i need help with my order", 0.35)])
+async def test_the_note_does_not_accumulate_across_turns() -> None:
+    async with running_agent() as agent:
+        await agent.say([("first question here", 0.95)])
+        await agent.say([("second question here", 0.95)])
 
-    assert llm_strategy_session.llm.seen_contexts, "the LLM should be reached under this strategy"
-    assert "band=low" in llm_strategy_session.notes[-1]
-
-
-@pytest.mark.asyncio
-async def test_the_note_sits_directly_before_the_user_message(agent_session: Harness) -> None:
-    await agent_session.say([("what time do you close today", 0.94)])
-
-    roles = [getattr(item, "role", None) for item in agent_session.llm.seen_contexts[-1].items]
-    assert roles[-2:] == ["system", "user"]
+        latest = agent.llm.seen_contexts[-1]
+        notes = [
+            item
+            for item in latest.items
+            if getattr(item, "role", None) == "system"
+            and (item.text_content or "").startswith("[stt-confidence]")
+        ]
+        assert len(notes) == 1, "each generation carries one note, for the current turn"
 
 
 @pytest.mark.asyncio
-async def test_several_turns_in_a_row_stay_correct(agent_session: Harness) -> None:
-    script: Sequence[tuple[Script, str]] = [
-        ([("first clear question", 0.95)], "high"),
-        ([("garbled thing", 0.20)], "skipped"),
-        ([("another clear question", 0.88)], "high"),
-        ([("half heard request", 0.65)], "medium"),
-    ]
-    for turn, _ in script:
-        await agent_session.say(turn)
+async def test_llm_strategy_lets_the_model_answer_a_low_turn() -> None:
+    async with running_agent(LOW_CONFIDENCE_STRATEGY="llm") as agent:
+        await agent.say([("i need help with my order", 0.35)])
 
-    assert [n.split("band=")[1].split()[0] for n in agent_session.notes] == [
-        "high",
-        "high",
-        "medium",
-    ]
-    assert agent_session.spoken.count(CLARIFICATION) == 1
+        assert agent.llm.seen_contexts, "the LLM should be reached under this strategy"
+        assert "band=low" in agent.notes[-1]
+
+
+@pytest.mark.asyncio
+async def test_the_note_sits_directly_before_the_user_message() -> None:
+    """The note says "the next user message", so it had better come before one."""
+    async with running_agent() as agent:
+        await agent.say([("what time do you close today", 0.94)])
+
+        items = agent.llm.seen_contexts[-1].items
+        note_at = next(
+            i
+            for i, item in enumerate(items)
+            if getattr(item, "role", None) == "system"
+            and (item.text_content or "").startswith("[stt-confidence]")
+        )
+        assert roles_of(agent.llm.seen_contexts[-1])[note_at + 1] == "user"
+        assert "what time do you close today" in (items[note_at + 1].text_content or "")
+
+
+@pytest.mark.asyncio
+async def test_several_turns_in_a_row_stay_correct() -> None:
+    async with running_agent() as agent:
+        for turn in (
+            [("first clear question", 0.95)],
+            [("garbled thing", 0.20)],
+            [("another clear question", 0.88)],
+            [("half heard request", 0.65)],
+        ):
+            await agent.say(turn)
+
+        bands = [n.split("band=")[1].split()[0] for n in agent.notes]
+        assert bands == ["high", "high", "medium"]
+        assert agent.spoken.count(CLARIFICATION) == 1

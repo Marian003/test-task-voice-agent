@@ -176,15 +176,23 @@ class CollectingAudioOutput(io.AudioOutput):
             capabilities=io.AudioOutputCapabilities(pause=False),
             sample_rate=SAMPLE_RATE,
         )
+        self._captured = False
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
-        pass
+        self._captured = True
 
     def flush(self) -> None:
+        # Only report a segment we were actually given. Reporting unconditionally makes the
+        # framework log "playback_finished called more times than playback segments were
+        # captured" and can trip its false-interruption resume, which fires a second
+        # generation and makes anything asserting on the last LLM context non-deterministic.
+        if not self._captured:
+            return
+        self._captured = False
         self.on_playback_finished(playback_position=0.1, interrupted=False)
 
     def clear_buffer(self) -> None:
-        pass
+        self._captured = False
 
 
 class SilentAudioInput(io.AudioInput):
